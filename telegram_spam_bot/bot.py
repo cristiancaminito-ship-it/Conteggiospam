@@ -157,7 +157,6 @@ def main():
 
     application = Application.builder().token(token).build()
 
-    # Schedule daily reset at midnight
     application.job_queue.run_daily(reset_daily_counts, time(hour=0, minute=0, second=0))
 
     application.add_handler(CommandHandler("start", start_command))
