@@ -35,6 +35,14 @@ LINK_PATTERN = re.compile(
 LINK_ENTITY_TYPES = {MessageEntity.URL, MessageEntity.TEXT_LINK}
 HISTORY_RETENTION_DAYS = 45
 
+SPAM_KIND_LINK = "link"
+SPAM_KIND_VIDEO = "video"
+USAGE_TABLES = {
+    SPAM_KIND_LINK: "daily_usage",
+    SPAM_KIND_VIDEO: "daily_video_usage",
+}
+CUSTOM_LIMIT_MAX = 1000
+
 
 class SecretRedactionFilter(logging.Filter):
     """Redact the bot token from third-party library and application logs."""
@@ -56,6 +64,7 @@ class SecretRedactionFilter(logging.Filter):
 class BotConfig:
     token: str
     daily_limit: int
+    daily_video_limit: int
     timezone_name: str
     database_path: str
 
@@ -72,13 +81,8 @@ class BotConfig:
                 "to Replit Secrets."
             )
 
-        raw_limit = os.getenv("DAILY_SPAM_LIMIT", "1")
-        try:
-            daily_limit = int(raw_limit)
-        except ValueError as exc:
-            raise RuntimeError("DAILY_SPAM_LIMIT must be a whole number.") from exc
-        if daily_limit < 0:
-            raise RuntimeError("DAILY_SPAM_LIMIT cannot be negative.")
+        daily_limit = cls._parse_limit("DAILY_SPAM_LIMIT", "1")
+        daily_video_limit = cls._parse_limit("DAILY_VIDEO_LIMIT", "1")
 
         timezone_name = os.getenv("BOT_TIMEZONE", "Europe/Rome").strip()
         try:
@@ -91,9 +95,21 @@ class BotConfig:
         return cls(
             token=token,
             daily_limit=daily_limit,
+            daily_video_limit=daily_video_limit,
             timezone_name=timezone_name,
             database_path=os.getenv("SPAM_DB_PATH", "telegram_spam.sqlite3"),
         )
+
+    @staticmethod
+    def _parse_limit(env_name: str, default: str) -> int:
+        raw_limit = os.getenv(env_name, default)
+        try:
+            limit = int(raw_limit)
+        except ValueError as exc:
+            raise RuntimeError(f"{env_name} must be a whole number.") from exc
+        if limit < 0:
+            raise RuntimeError(f"{env_name} cannot be negative.")
+        return limit
 
 
 @dataclass(frozen=True)
@@ -106,21 +122,31 @@ def _has_link_entity(entities: list[MessageEntity] | None) -> bool:
     return any(entity.type in LINK_ENTITY_TYPES for entity in entities or [])
 
 
-def message_is_spam(message: Message) -> bool:
-    """Return true for photo messages or messages with a visible/hidden URL."""
+def message_spam_kind(message: Message) -> str | None:
+    """Classify a message: video note, link/photo spam, or not spam.
+
+    Returns SPAM_KIND_VIDEO for round video messages, SPAM_KIND_LINK for
+    messages containing a photo or a visible/hidden URL, else None.
+    """
+    if message.video_note:
+        return SPAM_KIND_VIDEO
+
     if message.photo:
-        return True
+        return SPAM_KIND_LINK
 
     if _has_link_entity(message.entities) or _has_link_entity(message.caption_entities):
-        return True
+        return SPAM_KIND_LINK
 
     text = message.text or ""
     caption = message.caption or ""
-    return bool(LINK_PATTERN.search(text) or LINK_PATTERN.search(caption))
+    if LINK_PATTERN.search(text) or LINK_PATTERN.search(caption):
+        return SPAM_KIND_LINK
+
+    return None
 
 
 class UsageStore:
-    """Persist per-chat, per-member daily spam counts."""
+    """Persist per-chat, per-member daily spam counts (link/photo and video)."""
 
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
@@ -151,6 +177,17 @@ class UsageStore:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS daily_video_usage (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                local_day TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, user_id, local_day)
+            )
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS known_groups (
                 chat_id INTEGER PRIMARY KEY,
                 title TEXT NOT NULL
@@ -161,10 +198,20 @@ class UsageStore:
             """
             CREATE TABLE IF NOT EXISTS group_limits (
                 chat_id INTEGER PRIMARY KEY,
-                daily_limit INTEGER NOT NULL CHECK (daily_limit >= 0)
+                daily_limit INTEGER NOT NULL CHECK (daily_limit >= 0),
+                video_daily_limit INTEGER
             )
             """
         )
+        # Migrate databases created before the video limit column existed.
+        columns = {
+            row[1]
+            for row in self._connection.execute("PRAGMA table_info(group_limits)")
+        }
+        if "video_daily_limit" not in columns:
+            self._connection.execute(
+                "ALTER TABLE group_limits ADD COLUMN video_daily_limit INTEGER"
+            )
 
     def register_group(self, chat_id: int, title: str) -> None:
         if self._connection is None:
@@ -210,8 +257,35 @@ class UsageStore:
             raise ValueError("daily_limit cannot be negative.")
         self._connection.execute(
             """
-            INSERT INTO group_limits (chat_id, daily_limit) VALUES (?, ?)
+            INSERT INTO group_limits (chat_id, daily_limit, video_daily_limit)
+            VALUES (?, ?, NULL)
             ON CONFLICT(chat_id) DO UPDATE SET daily_limit = excluded.daily_limit
+            """,
+            (chat_id, daily_limit),
+        )
+
+    def get_video_daily_limit(self, chat_id: int, default: int) -> int:
+        if self._connection is None:
+            raise RuntimeError("UsageStore.initialize() must be called first.")
+        row = self._connection.execute(
+            "SELECT video_daily_limit FROM group_limits WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return default
+        return int(row[0])
+
+    def set_video_daily_limit(self, chat_id: int, daily_limit: int) -> None:
+        if self._connection is None:
+            raise RuntimeError("UsageStore.initialize() must be called first.")
+        if daily_limit < 0:
+            raise ValueError("daily_limit cannot be negative.")
+        self._connection.execute(
+            """
+            INSERT INTO group_limits (chat_id, daily_limit, video_daily_limit)
+            VALUES (?, 0, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                video_daily_limit = excluded.video_daily_limit
             """,
             (chat_id, daily_limit),
         )
@@ -222,18 +296,24 @@ class UsageStore:
         user_id: int,
         local_day: date,
         daily_limit: int,
+        kind: str = SPAM_KIND_LINK,
     ) -> UsageDecision:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
+        table = USAGE_TABLES.get(kind)
+        if table is None:
+            raise ValueError(f"Unknown spam kind: {kind!r}")
         day_key = local_day.isoformat()
         cutoff = (local_day - timedelta(days=HISTORY_RETENTION_DAYS)).isoformat()
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute("DELETE FROM daily_usage WHERE local_day < ?", (cutoff,))
+            connection.execute(
+                f"DELETE FROM {table} WHERE local_day < ?", (cutoff,)
+            )
             row = connection.execute(
-                """
-                SELECT count FROM daily_usage
+                f"""
+                SELECT count FROM {table}
                 WHERE chat_id = ? AND user_id = ? AND local_day = ?
                 """,
                 (chat_id, user_id, day_key),
@@ -242,8 +322,8 @@ class UsageStore:
             if row is None:
                 count = 1
                 connection.execute(
-                    """
-                    INSERT INTO daily_usage (chat_id, user_id, local_day, count)
+                    f"""
+                    INSERT INTO {table} (chat_id, user_id, local_day, count)
                     VALUES (?, ?, ?, ?)
                     """,
                     (chat_id, user_id, day_key, count),
@@ -253,8 +333,8 @@ class UsageStore:
 
             allowed = count <= daily_limit
             connection.execute(
-                """
-                UPDATE daily_usage SET count = ?
+                f"""
+                UPDATE {table} SET count = ?
                 WHERE chat_id = ? AND user_id = ? AND local_day = ?
                 """,
                 (count, chat_id, user_id, day_key),
@@ -265,12 +345,21 @@ class UsageStore:
             connection.execute("ROLLBACK")
             raise
 
-    def get_count(self, chat_id: int, user_id: int, local_day: date) -> int:
+    def get_count(
+        self,
+        chat_id: int,
+        user_id: int,
+        local_day: date,
+        kind: str = SPAM_KIND_LINK,
+    ) -> int:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
+        table = USAGE_TABLES.get(kind)
+        if table is None:
+            raise ValueError(f"Unknown spam kind: {kind!r}")
         row = self._connection.execute(
-            """
-            SELECT count FROM daily_usage
+            f"""
+            SELECT count FROM {table}
             WHERE chat_id = ? AND user_id = ? AND local_day = ?
             """,
             (chat_id, user_id, local_day.isoformat()),
@@ -294,10 +383,12 @@ async def start_command(
     ):
         return
     await update.effective_message.reply_text(
-        "I help moderate group spam. I count messages containing a link or photo "
-        "per member and delete matching messages after the daily allowance is used. "
-        "Group administrators are exempt. To choose a group's allowance, run "
-        "/limit in that group and then run /limit here in private."
+        "I help moderate group spam. I count messages containing a link, a "
+        "photo, or a video message per member, and delete matching messages "
+        "after each daily allowance is used. Link/photo and video messages "
+        "have separate limits. Group administrators are exempt. To choose a "
+        "group's allowances, run /limit in that group and then run /limit "
+        "here in private."
     )
 
 
@@ -366,10 +457,37 @@ async def limit_command(
         for chat_id, title in available_groups
     ]
     await message.reply_text(
-        "Choose a group to set its daily allowance. The current default is "
-        f"{config.daily_limit} link/photo message(s) per member.",
+        "Choose a group to set its daily allowances. The current defaults are "
+        f"{config.daily_limit} link/photo message(s) and "
+        f"{config.daily_video_limit} video message(s) per member.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+def _limit_value_keyboard(
+    chat_id: int,
+    current_limit: int,
+    set_prefix: str,
+    custom_prefix: str,
+) -> InlineKeyboardMarkup:
+    values = (0, 1, 2, 3, 5, 10)
+    buttons = [
+        InlineKeyboardButton(
+            f"{value}{' ✓' if value == current_limit else ''}",
+            callback_data=f"limit:{set_prefix}:{chat_id}:{value}",
+        )
+        for value in values
+    ]
+    keyboard = [buttons[:3], buttons[3:]]
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "Enter another number",
+                callback_data=f"limit:{custom_prefix}:{chat_id}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def limit_callback(
@@ -411,49 +529,87 @@ async def limit_callback(
         return
 
     if action == "group" and len(parts) == 3:
-        current_limit = store.get_daily_limit(chat_id, config.daily_limit)
-        values = (0, 1, 2, 3, 5, 10)
-        buttons = [
-            InlineKeyboardButton(
-                f"{value}{' ✓' if value == current_limit else ''}",
-                callback_data=f"limit:set:{chat_id}:{value}",
-            )
-            for value in values
-        ]
-        keyboard = [buttons[:3], buttons[3:]]
-        keyboard.append(
+        current_link_limit = store.get_daily_limit(chat_id, config.daily_limit)
+        current_video_limit = store.get_video_daily_limit(
+            chat_id, config.daily_video_limit
+        )
+        keyboard = [
             [
                 InlineKeyboardButton(
-                    "Enter another number",
-                    callback_data=f"limit:custom:{chat_id}",
+                    "Link/photo allowance",
+                    callback_data=f"limit:editlink:{chat_id}",
                 )
-            ]
-        )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Video message allowance",
+                    callback_data=f"limit:editvideo:{chat_id}",
+                )
+            ],
+        ]
         await query.edit_message_text(
-            f"{title}\n\nChoose how many link/photo messages each member may "
-            "send per day. Choose 0 to delete every matching message.",
+            f"{title}\n\n"
+            f"Current allowances per member per day:\n"
+            f"• Link/photo messages: {current_link_limit}\n"
+            f"• Video messages: {current_video_limit}\n\n"
+            "Choose which allowance to change. Choose 0 to delete every "
+            "matching message.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    if action == "custom" and len(parts) == 3:
-        context.user_data["pending_limit_chat_id"] = chat_id
+    if action == "editlink" and len(parts) == 3:
+        current_limit = store.get_daily_limit(chat_id, config.daily_limit)
         await query.edit_message_text(
-            f"Send a whole number from 0 to 1000 for {title}'s daily allowance."
+            f"{title}\n\nHow many link/photo messages may each member send "
+            "per day?",
+            reply_markup=_limit_value_keyboard(
+                chat_id, current_limit, "setlink", "customlink"
+            ),
         )
         return
 
-    if action == "set" and len(parts) == 4:
+    if action == "editvideo" and len(parts) == 3:
+        current_limit = store.get_video_daily_limit(
+            chat_id, config.daily_video_limit
+        )
+        await query.edit_message_text(
+            f"{title}\n\nHow many video messages may each member send per day?",
+            reply_markup=_limit_value_keyboard(
+                chat_id, current_limit, "setvideo", "customvideo"
+            ),
+        )
+        return
+
+    if action in ("customlink", "customvideo") and len(parts) == 3:
+        kind = SPAM_KIND_LINK if action == "customlink" else SPAM_KIND_VIDEO
+        context.user_data["pending_limit"] = {
+            "chat_id": chat_id,
+            "kind": kind,
+        }
+        label = "link/photo" if kind == SPAM_KIND_LINK else "video"
+        await query.edit_message_text(
+            f"Send a whole number from 0 to {CUSTOM_LIMIT_MAX} for {title}'s "
+            f"daily {label} message allowance."
+        )
+        return
+
+    if action in ("setlink", "setvideo") and len(parts) == 4:
         try:
             daily_limit = int(parts[3])
         except ValueError:
             return
-        if not 0 <= daily_limit <= 1000:
+        if not 0 <= daily_limit <= CUSTOM_LIMIT_MAX:
             return
-        store.set_daily_limit(chat_id, daily_limit)
+        kind = SPAM_KIND_LINK if action == "setlink" else SPAM_KIND_VIDEO
+        if kind == SPAM_KIND_LINK:
+            store.set_daily_limit(chat_id, daily_limit)
+        else:
+            store.set_video_daily_limit(chat_id, daily_limit)
+        label = "link/photo" if kind == SPAM_KIND_LINK else "video"
         await query.edit_message_text(
-            f"{title}: the daily allowance is now {daily_limit} "
-            "link/photo message(s) per member."
+            f"{title}: the daily {label} message allowance is now "
+            f"{daily_limit} per member."
         )
 
 
@@ -470,21 +626,30 @@ async def custom_limit_message(
     ):
         return
 
-    chat_id = context.user_data.get("pending_limit_chat_id")
-    if not isinstance(chat_id, int):
+    pending = context.user_data.get("pending_limit")
+    if not isinstance(pending, dict):
+        return
+    chat_id = pending.get("chat_id")
+    kind = pending.get("kind", SPAM_KIND_LINK)
+    if not isinstance(chat_id, int) or kind not in USAGE_TABLES:
+        context.user_data.pop("pending_limit", None)
         return
 
     try:
         daily_limit = int(message.text or "")
     except ValueError:
-        await message.reply_text("Enter a whole number from 0 to 1000.")
+        await message.reply_text(
+            f"Enter a whole number from 0 to {CUSTOM_LIMIT_MAX}."
+        )
         return
-    if not 0 <= daily_limit <= 1000:
-        await message.reply_text("Enter a whole number from 0 to 1000.")
+    if not 0 <= daily_limit <= CUSTOM_LIMIT_MAX:
+        await message.reply_text(
+            f"Enter a whole number from 0 to {CUSTOM_LIMIT_MAX}."
+        )
         return
 
     if not await _is_group_admin(context, chat_id, user.id):
-        context.user_data.pop("pending_limit_chat_id", None)
+        context.user_data.pop("pending_limit", None)
         await message.reply_text(
             "I could not verify that you are an administrator of that group."
         )
@@ -493,18 +658,22 @@ async def custom_limit_message(
     store: UsageStore = context.application.bot_data["usage_store"]
     title = store.get_group_title(chat_id)
     if title is None:
-        context.user_data.pop("pending_limit_chat_id", None)
+        context.user_data.pop("pending_limit", None)
         await message.reply_text(
             "That group is no longer registered. Run /limit in the group "
             "and try again."
         )
         return
 
-    store.set_daily_limit(chat_id, daily_limit)
-    context.user_data.pop("pending_limit_chat_id", None)
+    if kind == SPAM_KIND_LINK:
+        store.set_daily_limit(chat_id, daily_limit)
+    else:
+        store.set_video_daily_limit(chat_id, daily_limit)
+    context.user_data.pop("pending_limit", None)
+    label = "link/photo" if kind == SPAM_KIND_LINK else "video"
     await message.reply_text(
-        f"{title}: the daily allowance is now {daily_limit} "
-        "link/photo message(s) per member."
+        f"{title}: the daily {label} message allowance is now "
+        f"{daily_limit} per member."
     )
 
 
@@ -528,7 +697,11 @@ async def moderate_group_message(
         chat.id,
         getattr(chat, "title", None) or f"Group {chat.id}",
     )
-    if user is None or not message_is_spam(message):
+    if user is None:
+        return
+
+    kind = message_spam_kind(message)
+    if kind is None:
         return
 
     try:
@@ -544,8 +717,11 @@ async def moderate_group_message(
         return
 
     local_day = datetime.now(config.timezone).date()
-    daily_limit = store.get_daily_limit(chat.id, config.daily_limit)
-    decision = store.record_spam(chat.id, user.id, local_day, daily_limit)
+    if kind == SPAM_KIND_VIDEO:
+        daily_limit = store.get_video_daily_limit(chat.id, config.daily_video_limit)
+    else:
+        daily_limit = store.get_daily_limit(chat.id, config.daily_limit)
+    decision = store.record_spam(chat.id, user.id, local_day, daily_limit, kind=kind)
     if decision.allowed:
         return
 
@@ -598,8 +774,9 @@ def main() -> None:
     application = build_application(config, store)
 
     LOGGER.info(
-        "Starting group moderation: daily limit=%d, timezone=%s.",
+        "Starting group moderation: link limit=%d, video limit=%d, timezone=%s.",
         config.daily_limit,
+        config.daily_video_limit,
         config.timezone_name,
     )
     try:
