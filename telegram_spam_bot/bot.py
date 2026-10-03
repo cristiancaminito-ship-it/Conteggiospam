@@ -35,6 +35,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), check_link_entity))
+    application.add_handler(CommandHandler("limit", limit_command))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
     
 if __name__ == "__main__":
