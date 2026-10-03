@@ -3,7 +3,7 @@ import logging
 import os
 import sqlite3
 import re
-from datetime import time
+from datetime import time, date
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -64,9 +64,9 @@ def check_and_increment(chat_id: int, user_id: int, date_str: str) -> bool:
         SELECT count FROM user_counts WHERE chat_id = ? AND user_id = ? AND date = ?
     """, (chat_id, user_id, date_str))
     result = cursor.fetchone()
-    
+
     limit = get_limit(chat_id)
-    
+
     if result is None:
         if 1 <= limit:
             cursor.execute("""
@@ -141,7 +141,6 @@ async def check_link_entity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = message.from_user.id
         date_str = str(date.today())
 
-        # Administrators are exempt
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         if chat_member.status in ['creator', 'administrator']:
             return
@@ -157,7 +156,7 @@ def main():
         raise ValueError("BOT_TOKEN non impostato nelle variabili d'ambiente.")
 
     application = Application.builder().token(token).build()
-    
+
     # Schedule daily reset at midnight
     application.job_queue.run_daily(reset_daily_counts, time(hour=0, minute=0, second=0))
 
@@ -170,5 +169,4 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    from datetime import date
     main()
