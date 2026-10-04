@@ -35,14 +35,6 @@ LINK_PATTERN = re.compile(
 LINK_ENTITY_TYPES = {MessageEntity.URL, MessageEntity.TEXT_LINK}
 HISTORY_RETENTION_DAYS = 45
 
-SPAM_KIND_LINK = "link"
-SPAM_KIND_VIDEO = "video"
-USAGE_TABLES = {
-    SPAM_KIND_LINK: "daily_usage",
-    SPAM_KIND_VIDEO: "daily_video_usage",
-}
-CUSTOM_LIMIT_MAX = 1000
-
 
 class SecretRedactionFilter(logging.Filter):
     """Redact the bot token from third-party library and application logs."""
@@ -64,7 +56,6 @@ class SecretRedactionFilter(logging.Filter):
 class BotConfig:
     token: str
     daily_limit: int
-    daily_video_limit: int
     timezone_name: str
     database_path: str
 
@@ -81,8 +72,13 @@ class BotConfig:
                 "to Replit Secrets."
             )
 
-        daily_limit = cls._parse_limit("DAILY_SPAM_LIMIT", "1")
-        daily_video_limit = cls._parse_limit("DAILY_VIDEO_LIMIT", "1")
+        raw_limit = os.getenv("DAILY_SPAM_LIMIT", "1")
+        try:
+            daily_limit = int(raw_limit)
+        except ValueError as exc:
+            raise RuntimeError("DAILY_SPAM_LIMIT must be a whole number.") from exc
+        if daily_limit < 0:
+            raise RuntimeError("DAILY_SPAM_LIMIT cannot be negative.")
 
         timezone_name = os.getenv("BOT_TIMEZONE", "Europe/Rome").strip()
         try:
@@ -92,24 +88,36 @@ class BotConfig:
                 f"BOT_TIMEZONE is not a recognized timezone: {timezone_name!r}."
             ) from exc
 
+        railway_volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+        default_database_path = "telegram_spam.sqlite3"
+        if railway_volume_path:
+            volume_directory = Path(railway_volume_path).expanduser()
+            if not volume_directory.is_dir():
+                raise RuntimeError(
+                    "RAILWAY_VOLUME_MOUNT_PATH is set but is not a mounted directory."
+                )
+            default_database_path = str(
+                volume_directory / "telegram_spam.sqlite3"
+            )
+        database_path = (
+            os.getenv("SPAM_DB_PATH", "").strip() or default_database_path
+        )
+        if railway_volume_path:
+            resolved_volume = volume_directory.resolve()
+            resolved_database = Path(database_path).expanduser().resolve()
+            if not resolved_database.is_relative_to(resolved_volume):
+                raise RuntimeError(
+                    "SPAM_DB_PATH must point inside RAILWAY_VOLUME_MOUNT_PATH "
+                    "so the database survives Railway redeploys."
+                )
+            database_path = str(resolved_database)
+
         return cls(
             token=token,
             daily_limit=daily_limit,
-            daily_video_limit=daily_video_limit,
             timezone_name=timezone_name,
-            database_path=os.getenv("SPAM_DB_PATH", "telegram_spam.sqlite3"),
+            database_path=database_path,
         )
-
-    @staticmethod
-    def _parse_limit(env_name: str, default: str) -> int:
-        raw_limit = os.getenv(env_name, default)
-        try:
-            limit = int(raw_limit)
-        except ValueError as exc:
-            raise RuntimeError(f"{env_name} must be a whole number.") from exc
-        if limit < 0:
-            raise RuntimeError(f"{env_name} cannot be negative.")
-        return limit
 
 
 @dataclass(frozen=True)
@@ -122,31 +130,21 @@ def _has_link_entity(entities: list[MessageEntity] | None) -> bool:
     return any(entity.type in LINK_ENTITY_TYPES for entity in entities or [])
 
 
-def message_spam_kind(message: Message) -> str | None:
-    """Classify a message: video note, link/photo spam, or not spam.
-
-    Returns SPAM_KIND_VIDEO for round video messages, SPAM_KIND_LINK for
-    messages containing a photo or a visible/hidden URL, else None.
-    """
-    if message.video_note:
-        return SPAM_KIND_VIDEO
-
+def message_is_spam(message: Message) -> bool:
+    """Return true for photo messages or messages with a visible/hidden URL."""
     if message.photo:
-        return SPAM_KIND_LINK
+        return True
 
     if _has_link_entity(message.entities) or _has_link_entity(message.caption_entities):
-        return SPAM_KIND_LINK
+        return True
 
     text = message.text or ""
     caption = message.caption or ""
-    if LINK_PATTERN.search(text) or LINK_PATTERN.search(caption):
-        return SPAM_KIND_LINK
-
-    return None
+    return bool(LINK_PATTERN.search(text) or LINK_PATTERN.search(caption))
 
 
 class UsageStore:
-    """Persist per-chat, per-member daily spam counts (link/photo and video)."""
+    """Persist per-chat, per-member daily spam counts."""
 
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
@@ -177,7 +175,7 @@ class UsageStore:
         )
         self._connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS daily_video_usage (
+            CREATE TABLE IF NOT EXISTS daily_bubble_usage (
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 local_day TEXT NOT NULL,
@@ -198,20 +196,19 @@ class UsageStore:
             """
             CREATE TABLE IF NOT EXISTS group_limits (
                 chat_id INTEGER PRIMARY KEY,
-                daily_limit INTEGER NOT NULL CHECK (daily_limit >= 0),
-                video_daily_limit INTEGER
+                daily_limit INTEGER NOT NULL CHECK (daily_limit >= 0)
             )
             """
         )
-        # Migrate databases created before the video limit column existed.
-        columns = {
-            row[1]
-            for row in self._connection.execute("PRAGMA table_info(group_limits)")
-        }
-        if "video_daily_limit" not in columns:
-            self._connection.execute(
-                "ALTER TABLE group_limits ADD COLUMN video_daily_limit INTEGER"
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bubble_video_settings (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                daily_limit INTEGER NOT NULL DEFAULT 2 CHECK (daily_limit >= 0)
             )
+            """
+        )
 
     def register_group(self, chat_id: int, title: str) -> None:
         if self._connection is None:
@@ -257,35 +254,45 @@ class UsageStore:
             raise ValueError("daily_limit cannot be negative.")
         self._connection.execute(
             """
-            INSERT INTO group_limits (chat_id, daily_limit, video_daily_limit)
-            VALUES (?, ?, NULL)
+            INSERT INTO group_limits (chat_id, daily_limit) VALUES (?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET daily_limit = excluded.daily_limit
             """,
             (chat_id, daily_limit),
         )
 
-    def get_video_daily_limit(self, chat_id: int, default: int) -> int:
+    def get_bubble_video_settings(self, chat_id: int) -> tuple[bool, int]:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
         row = self._connection.execute(
-            "SELECT video_daily_limit FROM group_limits WHERE chat_id = ?",
+            "SELECT enabled, daily_limit FROM bubble_video_settings WHERE chat_id = ?",
             (chat_id,),
         ).fetchone()
-        if row is None or row[0] is None:
-            return default
-        return int(row[0])
+        if row is None:
+            return False, 2
+        return bool(row[0]), int(row[1])
 
-    def set_video_daily_limit(self, chat_id: int, daily_limit: int) -> None:
+    def set_bubble_video_enabled(self, chat_id: int, enabled: bool) -> None:
+        if self._connection is None:
+            raise RuntimeError("UsageStore.initialize() must be called first.")
+        self._connection.execute(
+            """
+            INSERT INTO bubble_video_settings (chat_id, enabled, daily_limit)
+            VALUES (?, ?, 2)
+            ON CONFLICT(chat_id) DO UPDATE SET enabled = excluded.enabled
+            """,
+            (chat_id, int(enabled)),
+        )
+
+    def set_bubble_video_daily_limit(self, chat_id: int, daily_limit: int) -> None:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
         if daily_limit < 0:
             raise ValueError("daily_limit cannot be negative.")
         self._connection.execute(
             """
-            INSERT INTO group_limits (chat_id, daily_limit, video_daily_limit)
+            INSERT INTO bubble_video_settings (chat_id, enabled, daily_limit)
             VALUES (?, 0, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                video_daily_limit = excluded.video_daily_limit
+            ON CONFLICT(chat_id) DO UPDATE SET daily_limit = excluded.daily_limit
             """,
             (chat_id, daily_limit),
         )
@@ -296,24 +303,45 @@ class UsageStore:
         user_id: int,
         local_day: date,
         daily_limit: int,
-        kind: str = SPAM_KIND_LINK,
+    ) -> UsageDecision:
+        return self._record_daily_usage(
+            "daily_usage", chat_id, user_id, local_day, daily_limit
+        )
+
+    def record_bubble_video(
+        self,
+        chat_id: int,
+        user_id: int,
+        local_day: date,
+        daily_limit: int,
+    ) -> UsageDecision:
+        return self._record_daily_usage(
+            "daily_bubble_usage", chat_id, user_id, local_day, daily_limit
+        )
+
+    def _record_daily_usage(
+        self,
+        table_name: str,
+        chat_id: int,
+        user_id: int,
+        local_day: date,
+        daily_limit: int,
     ) -> UsageDecision:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
-        table = USAGE_TABLES.get(kind)
-        if table is None:
-            raise ValueError(f"Unknown spam kind: {kind!r}")
+        if table_name not in {"daily_usage", "daily_bubble_usage"}:
+            raise ValueError("Unknown daily usage category.")
         day_key = local_day.isoformat()
         cutoff = (local_day - timedelta(days=HISTORY_RETENTION_DAYS)).isoformat()
         connection = self._connection
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute(
-                f"DELETE FROM {table} WHERE local_day < ?", (cutoff,)
+                f"DELETE FROM {table_name} WHERE local_day < ?", (cutoff,)
             )
             row = connection.execute(
                 f"""
-                SELECT count FROM {table}
+                SELECT count FROM {table_name}
                 WHERE chat_id = ? AND user_id = ? AND local_day = ?
                 """,
                 (chat_id, user_id, day_key),
@@ -323,7 +351,7 @@ class UsageStore:
                 count = 1
                 connection.execute(
                     f"""
-                    INSERT INTO {table} (chat_id, user_id, local_day, count)
+                    INSERT INTO {table_name} (chat_id, user_id, local_day, count)
                     VALUES (?, ?, ?, ?)
                     """,
                     (chat_id, user_id, day_key, count),
@@ -334,7 +362,7 @@ class UsageStore:
             allowed = count <= daily_limit
             connection.execute(
                 f"""
-                UPDATE {table} SET count = ?
+                UPDATE {table_name} SET count = ?
                 WHERE chat_id = ? AND user_id = ? AND local_day = ?
                 """,
                 (count, chat_id, user_id, day_key),
@@ -345,21 +373,26 @@ class UsageStore:
             connection.execute("ROLLBACK")
             raise
 
-    def get_count(
-        self,
-        chat_id: int,
-        user_id: int,
-        local_day: date,
-        kind: str = SPAM_KIND_LINK,
+    def get_count(self, chat_id: int, user_id: int, local_day: date) -> int:
+        return self._get_daily_count("daily_usage", chat_id, user_id, local_day)
+
+    def get_bubble_video_count(
+        self, chat_id: int, user_id: int, local_day: date
+    ) -> int:
+        return self._get_daily_count(
+            "daily_bubble_usage", chat_id, user_id, local_day
+        )
+
+    def _get_daily_count(
+        self, table_name: str, chat_id: int, user_id: int, local_day: date
     ) -> int:
         if self._connection is None:
             raise RuntimeError("UsageStore.initialize() must be called first.")
-        table = USAGE_TABLES.get(kind)
-        if table is None:
-            raise ValueError(f"Unknown spam kind: {kind!r}")
+        if table_name not in {"daily_usage", "daily_bubble_usage"}:
+            raise ValueError("Unknown daily usage category.")
         row = self._connection.execute(
             f"""
-            SELECT count FROM {table}
+            SELECT count FROM {table_name}
             WHERE chat_id = ? AND user_id = ? AND local_day = ?
             """,
             (chat_id, user_id, local_day.isoformat()),
@@ -383,12 +416,11 @@ async def start_command(
     ):
         return
     await update.effective_message.reply_text(
-        "I help moderate group spam. I count messages containing a link, a "
-        "photo, or a video message per member, and delete matching messages "
-        "after each daily allowance is used. Link/photo and video messages "
-        "have separate limits. Group administrators are exempt. To choose a "
-        "group's allowances, run /limit in that group and then run /limit "
-        "here in private."
+        "I help moderate group spam. I count messages containing a link or photo "
+        "per member and delete matching messages after the daily allowance is used. "
+        "Bubble-video moderation is also available and is off until a group "
+        "administrator enables it. Group administrators are exempt. To manage "
+        "these settings, run /limit in a group and then /limit here in private."
     )
 
 
@@ -457,37 +489,59 @@ async def limit_command(
         for chat_id, title in available_groups
     ]
     await message.reply_text(
-        "Choose a group to set its daily allowances. The current defaults are "
-        f"{config.daily_limit} link/photo message(s) and "
-        f"{config.daily_video_limit} video message(s) per member.",
+        "Choose a group to manage its link/photo and bubble-video limits. The "
+        f"default link/photo allowance is {config.daily_limit} message(s) per member.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-def _limit_value_keyboard(
+def _bubble_video_menu(
+    title: str,
     chat_id: int,
-    current_limit: int,
-    set_prefix: str,
-    custom_prefix: str,
-) -> InlineKeyboardMarkup:
+    enabled: bool,
+    daily_limit: int,
+    notice: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    status = "enabled" if enabled else "disabled"
+    text = (
+        f"{title}\n\nBubble-video moderation is {status}. "
+        f"Daily allowance: {daily_limit} per member. "
+        "It is disabled until you turn it on."
+    )
+    if enabled:
+        text = (
+            f"{title}\n\nBubble-video moderation is enabled. "
+            f"Daily allowance: {daily_limit} per member."
+        )
+    if notice:
+        text = f"{notice}\n\n{text}"
+
     values = (0, 1, 2, 3, 5, 10)
     buttons = [
         InlineKeyboardButton(
-            f"{value}{' ✓' if value == current_limit else ''}",
-            callback_data=f"limit:{set_prefix}:{chat_id}:{value}",
+            f"{value}{' ✓' if value == daily_limit else ''}",
+            callback_data=f"limit:bubble-set:{chat_id}:{value}",
         )
         for value in values
     ]
-    keyboard = [buttons[:3], buttons[3:]]
-    keyboard.append(
+    toggle_label = "Turn off bubble-video moderation" if enabled else "Enable bubble-video moderation"
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                toggle_label,
+                callback_data=f"limit:bubble-toggle:{chat_id}",
+            )
+        ],
+        buttons[:3],
+        buttons[3:],
         [
             InlineKeyboardButton(
                 "Enter another number",
-                callback_data=f"limit:{custom_prefix}:{chat_id}",
+                callback_data=f"limit:bubble-custom:{chat_id}",
             )
-        ]
-    )
-    return InlineKeyboardMarkup(keyboard)
+        ],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
 
 async def limit_callback(
@@ -529,87 +583,120 @@ async def limit_callback(
         return
 
     if action == "group" and len(parts) == 3:
-        current_link_limit = store.get_daily_limit(chat_id, config.daily_limit)
-        current_video_limit = store.get_video_daily_limit(
-            chat_id, config.daily_video_limit
-        )
+        bubble_enabled, bubble_limit = store.get_bubble_video_settings(chat_id)
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "Link/photo allowance",
-                    callback_data=f"limit:editlink:{chat_id}",
+                    "Link/photo messages",
+                    callback_data=f"limit:spam:{chat_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "Video message allowance",
-                    callback_data=f"limit:editvideo:{chat_id}",
+                    f"Bubble videos: {'On' if bubble_enabled else 'Off'} "
+                    f"({bubble_limit}/day)",
+                    callback_data=f"limit:bubble:{chat_id}",
                 )
             ],
         ]
         await query.edit_message_text(
-            f"{title}\n\n"
-            f"Current allowances per member per day:\n"
-            f"• Link/photo messages: {current_link_limit}\n"
-            f"• Video messages: {current_video_limit}\n\n"
-            "Choose which allowance to change. Choose 0 to delete every "
-            "matching message.",
+            f"{title}\n\nChoose which group limit to manage.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    if action == "editlink" and len(parts) == 3:
+    if action == "spam" and len(parts) == 3:
         current_limit = store.get_daily_limit(chat_id, config.daily_limit)
+        values = (0, 1, 2, 3, 5, 10)
+        buttons = [
+            InlineKeyboardButton(
+                f"{value}{' ✓' if value == current_limit else ''}",
+                callback_data=f"limit:set:{chat_id}:{value}",
+            )
+            for value in values
+        ]
+        keyboard = [buttons[:3], buttons[3:]]
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "Enter another number",
+                    callback_data=f"limit:custom:{chat_id}",
+                )
+            ]
+        )
         await query.edit_message_text(
-            f"{title}\n\nHow many link/photo messages may each member send "
-            "per day?",
-            reply_markup=_limit_value_keyboard(
-                chat_id, current_limit, "setlink", "customlink"
-            ),
+            f"{title}\n\nChoose how many link/photo messages each member may "
+            "send per day. Choose 0 to delete every matching message.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    if action == "editvideo" and len(parts) == 3:
-        current_limit = store.get_video_daily_limit(
-            chat_id, config.daily_video_limit
-        )
-        await query.edit_message_text(
-            f"{title}\n\nHow many video messages may each member send per day?",
-            reply_markup=_limit_value_keyboard(
-                chat_id, current_limit, "setvideo", "customvideo"
-            ),
-        )
+    if action == "bubble" and len(parts) == 3:
+        enabled, daily_limit = store.get_bubble_video_settings(chat_id)
+        text, keyboard = _bubble_video_menu(title, chat_id, enabled, daily_limit)
+        await query.edit_message_text(text, reply_markup=keyboard)
         return
 
-    if action in ("customlink", "customvideo") and len(parts) == 3:
-        kind = SPAM_KIND_LINK if action == "customlink" else SPAM_KIND_VIDEO
-        context.user_data["pending_limit"] = {
-            "chat_id": chat_id,
-            "kind": kind,
-        }
-        label = "link/photo" if kind == SPAM_KIND_LINK else "video"
-        await query.edit_message_text(
-            f"Send a whole number from 0 to {CUSTOM_LIMIT_MAX} for {title}'s "
-            f"daily {label} message allowance."
+    if action == "bubble-toggle" and len(parts) == 3:
+        enabled, daily_limit = store.get_bubble_video_settings(chat_id)
+        enabled = not enabled
+        store.set_bubble_video_enabled(chat_id, enabled)
+        text, keyboard = _bubble_video_menu(
+            title,
+            chat_id,
+            enabled,
+            daily_limit,
+            notice="Bubble-video moderation enabled." if enabled else "Bubble-video moderation disabled.",
         )
+        await query.edit_message_text(text, reply_markup=keyboard)
         return
 
-    if action in ("setlink", "setvideo") and len(parts) == 4:
+    if action == "bubble-set" and len(parts) == 4:
         try:
             daily_limit = int(parts[3])
         except ValueError:
             return
-        if not 0 <= daily_limit <= CUSTOM_LIMIT_MAX:
+        if not 0 <= daily_limit <= 1000:
             return
-        kind = SPAM_KIND_LINK if action == "setlink" else SPAM_KIND_VIDEO
-        if kind == SPAM_KIND_LINK:
-            store.set_daily_limit(chat_id, daily_limit)
-        else:
-            store.set_video_daily_limit(chat_id, daily_limit)
-        label = "link/photo" if kind == SPAM_KIND_LINK else "video"
+        store.set_bubble_video_daily_limit(chat_id, daily_limit)
+        enabled, saved_limit = store.get_bubble_video_settings(chat_id)
+        text, keyboard = _bubble_video_menu(
+            title,
+            chat_id,
+            enabled,
+            saved_limit,
+            notice=f"Daily bubble-video allowance saved as {saved_limit}.",
+        )
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+
+    if action == "custom" and len(parts) == 3:
+        context.user_data["pending_limit_chat_id"] = chat_id
+        context.user_data["pending_limit_kind"] = "spam"
         await query.edit_message_text(
-            f"{title}: the daily {label} message allowance is now "
-            f"{daily_limit} per member."
+            f"Send a whole number from 0 to 1000 for {title}'s daily allowance."
+        )
+        return
+
+    if action == "bubble-custom" and len(parts) == 3:
+        context.user_data["pending_limit_chat_id"] = chat_id
+        context.user_data["pending_limit_kind"] = "bubble"
+        await query.edit_message_text(
+            f"Send a whole number from 0 to 1000 for {title}'s daily bubble-video allowance."
+        )
+        return
+
+    if action == "set" and len(parts) == 4:
+        try:
+            daily_limit = int(parts[3])
+        except ValueError:
+            return
+        if not 0 <= daily_limit <= 1000:
+            return
+        store.set_daily_limit(chat_id, daily_limit)
+        await query.edit_message_text(
+            f"{title}: the daily allowance is now {daily_limit} "
+            "link/photo message(s) per member."
         )
 
 
@@ -626,30 +713,22 @@ async def custom_limit_message(
     ):
         return
 
-    pending = context.user_data.get("pending_limit")
-    if not isinstance(pending, dict):
-        return
-    chat_id = pending.get("chat_id")
-    kind = pending.get("kind", SPAM_KIND_LINK)
-    if not isinstance(chat_id, int) or kind not in USAGE_TABLES:
-        context.user_data.pop("pending_limit", None)
+    chat_id = context.user_data.get("pending_limit_chat_id")
+    if not isinstance(chat_id, int):
         return
 
     try:
         daily_limit = int(message.text or "")
     except ValueError:
-        await message.reply_text(
-            f"Enter a whole number from 0 to {CUSTOM_LIMIT_MAX}."
-        )
+        await message.reply_text("Enter a whole number from 0 to 1000.")
         return
-    if not 0 <= daily_limit <= CUSTOM_LIMIT_MAX:
-        await message.reply_text(
-            f"Enter a whole number from 0 to {CUSTOM_LIMIT_MAX}."
-        )
+    if not 0 <= daily_limit <= 1000:
+        await message.reply_text("Enter a whole number from 0 to 1000.")
         return
 
     if not await _is_group_admin(context, chat_id, user.id):
-        context.user_data.pop("pending_limit", None)
+        context.user_data.pop("pending_limit_chat_id", None)
+        context.user_data.pop("pending_limit_kind", None)
         await message.reply_text(
             "I could not verify that you are an administrator of that group."
         )
@@ -658,22 +737,25 @@ async def custom_limit_message(
     store: UsageStore = context.application.bot_data["usage_store"]
     title = store.get_group_title(chat_id)
     if title is None:
-        context.user_data.pop("pending_limit", None)
+        context.user_data.pop("pending_limit_chat_id", None)
+        context.user_data.pop("pending_limit_kind", None)
         await message.reply_text(
             "That group is no longer registered. Run /limit in the group "
             "and try again."
         )
         return
 
-    if kind == SPAM_KIND_LINK:
-        store.set_daily_limit(chat_id, daily_limit)
+    limit_kind = context.user_data.get("pending_limit_kind", "spam")
+    if limit_kind == "bubble":
+        store.set_bubble_video_daily_limit(chat_id, daily_limit)
+        description = "daily bubble-video allowance"
     else:
-        store.set_video_daily_limit(chat_id, daily_limit)
-    context.user_data.pop("pending_limit", None)
-    label = "link/photo" if kind == SPAM_KIND_LINK else "video"
+        store.set_daily_limit(chat_id, daily_limit)
+        description = "daily link/photo allowance"
+    context.user_data.pop("pending_limit_chat_id", None)
+    context.user_data.pop("pending_limit_kind", None)
     await message.reply_text(
-        f"{title}: the daily {label} message allowance is now "
-        f"{daily_limit} per member."
+        f"{title}: the {description} is now {daily_limit} per member."
     )
 
 
@@ -700,8 +782,14 @@ async def moderate_group_message(
     if user is None:
         return
 
-    kind = message_spam_kind(message)
-    if kind is None:
+    is_bubble_video = getattr(message, "video_note", None) is not None
+    if is_bubble_video:
+        bubble_enabled, daily_limit = store.get_bubble_video_settings(chat.id)
+        if not bubble_enabled:
+            return
+    elif message_is_spam(message):
+        daily_limit = store.get_daily_limit(chat.id, config.daily_limit)
+    else:
         return
 
     try:
@@ -717,11 +805,12 @@ async def moderate_group_message(
         return
 
     local_day = datetime.now(config.timezone).date()
-    if kind == SPAM_KIND_VIDEO:
-        daily_limit = store.get_video_daily_limit(chat.id, config.daily_video_limit)
+    if is_bubble_video:
+        decision = store.record_bubble_video(
+            chat.id, user.id, local_day, daily_limit
+        )
     else:
-        daily_limit = store.get_daily_limit(chat.id, config.daily_limit)
-    decision = store.record_spam(chat.id, user.id, local_day, daily_limit, kind=kind)
+        decision = store.record_spam(chat.id, user.id, local_day, daily_limit)
     if decision.allowed:
         return
 
@@ -774,9 +863,8 @@ def main() -> None:
     application = build_application(config, store)
 
     LOGGER.info(
-        "Starting group moderation: link limit=%d, video limit=%d, timezone=%s.",
+        "Starting group moderation: daily limit=%d, timezone=%s.",
         config.daily_limit,
-        config.daily_video_limit,
         config.timezone_name,
     )
     try:
